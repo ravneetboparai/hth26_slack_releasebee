@@ -29,6 +29,9 @@ class SlackMessageFetcher:
             raise ValueError("SLACK_BOT_TOKEN is required")
 
         self.client = WebClient(token=self.token)
+        self._user_cache = {}  # Cache user info to avoid repeated API calls
+        self._channel_cache = {}  # Cache channel info
+        self._thread_cache = {}  # Cache thread parent messages
 
     def fetch_messages(self, channel_id, start_time=None, end_time=None, limit=1000):
         """
@@ -88,9 +91,33 @@ class SlackMessageFetcher:
                 if not cursor or len(messages) >= limit:
                     break
 
+            # Fetch thread replies for messages that have threads
+            all_messages = []
+            for msg in messages:
+                # Add the parent message
+                all_messages.append(msg)
+
+                # If this message has replies, fetch them
+                if msg.get("reply_count", 0) > 0 and msg.get("ts"):
+                    try:
+                        thread_response = self.client.conversations_replies(
+                            channel=channel_id,
+                            ts=msg["ts"]
+                        )
+                        thread_messages = thread_response.get("messages", [])
+                        # Skip the first message (it's the parent, already added)
+                        for thread_msg in thread_messages[1:]:
+                            # Only include replies within our time window
+                            msg_ts = float(thread_msg.get("ts", 0))
+                            if start_timestamp <= msg_ts <= end_timestamp:
+                                all_messages.append(thread_msg)
+                    except SlackApiError:
+                        # If we can't fetch thread replies, continue
+                        pass
+
             # Filter out bot messages and format
             formatted_messages = []
-            for msg in messages:
+            for msg in all_messages:
                 # Skip bot messages
                 if msg.get("bot_id"):
                     continue
@@ -116,6 +143,127 @@ class SlackMessageFetcher:
             print(f"Error fetching messages: {e.response['error']}")
             raise
 
+    def get_user_name(self, user_id):
+        """
+        Get user's display name from user ID.
+
+        Args:
+            user_id: Slack user ID (e.g., 'U1234567890')
+
+        Returns:
+            User's display name or user ID if not found
+        """
+        if not user_id:
+            return "Unknown User"
+
+        # Check cache first
+        if user_id in self._user_cache:
+            return self._user_cache[user_id]
+
+        try:
+            response = self.client.users_info(user=user_id)
+            user = response.get("user", {})
+
+            # Prefer display name, fall back to real name, then username
+            name = (
+                user.get("profile", {}).get("display_name")
+                or user.get("profile", {}).get("real_name")
+                or user.get("name")
+                or user_id
+            )
+
+            self._user_cache[user_id] = name
+            return name
+
+        except SlackApiError as e:
+            # If we can't get the name, show a warning once
+            if "_user_read_warning_shown" not in self.__dict__:
+                self._user_read_warning_shown = True
+                error_msg = e.response.get("error", "unknown")
+                if error_msg == "missing_scope":
+                    print("\nWARNING: Bot is missing 'users:read' scope - showing user IDs instead of names")
+                    print("To fix: Add 'users:read' scope in Slack app settings and reinstall\n")
+
+            # Cache the ID so we don't keep trying
+            self._user_cache[user_id] = user_id
+            return user_id
+
+    def get_channel_name(self, channel_id):
+        """
+        Get channel name from channel ID.
+
+        Args:
+            channel_id: Slack channel ID (e.g., 'C1234567890')
+
+        Returns:
+            Channel name or channel ID if not found
+        """
+        if not channel_id:
+            return "Unknown Channel"
+
+        # Check cache first
+        if channel_id in self._channel_cache:
+            return self._channel_cache[channel_id]
+
+        try:
+            response = self.client.conversations_info(channel=channel_id)
+            channel = response.get("channel", {})
+            name = channel.get("name") or channel_id
+
+            self._channel_cache[channel_id] = name
+            return name
+
+        except SlackApiError:
+            self._channel_cache[channel_id] = channel_id
+            return channel_id
+
+    def get_thread_parent(self, channel_id, thread_ts):
+        """
+        Get the parent message of a thread.
+
+        Args:
+            channel_id: Slack channel ID
+            thread_ts: Thread timestamp (parent message timestamp)
+
+        Returns:
+            Dictionary with parent message info or None if not found
+        """
+        if not thread_ts:
+            return None
+
+        # Check cache first
+        cache_key = f"{channel_id}:{thread_ts}"
+        if cache_key in self._thread_cache:
+            return self._thread_cache[cache_key]
+
+        try:
+            # Fetch the specific message using conversations.history with inclusive timestamps
+            response = self.client.conversations_history(
+                channel=channel_id,
+                oldest=thread_ts,
+                latest=thread_ts,
+                inclusive=True,
+                limit=1
+            )
+
+            messages = response.get("messages", [])
+            if messages:
+                parent_msg = messages[0]
+                result = {
+                    "text": parent_msg.get("text", ""),
+                    "user": parent_msg.get("user"),
+                    "timestamp": parent_msg.get("ts")
+                }
+                self._thread_cache[cache_key] = result
+                return result
+
+        except SlackApiError:
+            pass
+
+        # Cache None so we don't keep trying
+        self._thread_cache[cache_key] = None
+        return None
+
     def get_channel_id_by_name(self, channel_name):
         """
         Get channel ID from channel name.
@@ -138,7 +286,10 @@ class SlackMessageFetcher:
 
             for channel in response.get("channels", []):
                 if channel.get("name") == channel_name:
-                    return channel.get("id")
+                    channel_id = channel.get("id")
+                    # Cache it
+                    self._channel_cache[channel_id] = channel_name
+                    return channel_id
 
             return None
 
@@ -234,16 +385,43 @@ def main():
     # Fetch messages
     try:
         messages = fetcher.fetch_messages(channel_id, start_time, end_time, args.limit)
-        print(f"\nFetched {len(messages)} messages\n")
+        print(f"\n{'='*70}")
+        print(f"Fetched {len(messages)} messages from #{fetcher.get_channel_name(channel_id)}")
+        print(f"{'='*70}\n")
 
-        # Display messages
-        for msg in messages:
-            print("=" * 60)
-            print(f"Time: {msg['datetime']}")
-            print(f"User: {msg['user']}")
-            print(f"Text: {msg['text']}")
-            print("=" * 60)
-            print()
+        # Display messages in readable format
+        for i, msg in enumerate(messages, 1):
+            # Parse datetime
+            msg_time = datetime.fromisoformat(msg['datetime'])
+            time_str = msg_time.strftime("%b %d, %Y at %I:%M:%S %p")
+
+            # Get user name
+            user_name = fetcher.get_user_name(msg['user'])
+
+            # Format message
+            print(f"[{i}] {time_str}")
+            print(f"User: {user_name}")
+            print(f"Message: {msg['text']}")
+
+            # Show thread context if in a thread
+            if msg.get('thread_ts') and msg['thread_ts'] != msg['timestamp']:
+                parent = fetcher.get_thread_parent(channel_id, msg['thread_ts'])
+                if parent:
+                    parent_user = fetcher.get_user_name(parent.get('user'))
+                    parent_text = parent.get('text', '')
+                    # Truncate parent text if too long
+                    if len(parent_text) > 60:
+                        parent_text = parent_text[:60] + "..."
+                    print(f"  Reply to {parent_user}: \"{parent_text}\"")
+                else:
+                    print(f"  (in thread)")
+
+            print(f"{'-'*70}\n")
+
+        # Summary
+        print(f"\n{'='*70}")
+        print(f"Total: {len(messages)} messages")
+        print(f"{'='*70}\n")
 
         # Save to file if requested
         if args.output:
@@ -251,11 +429,10 @@ def main():
 
             with open(args.output, "w") as f:
                 json.dump(messages, f, indent=2)
-            print(f"\n✅ Saved {len(messages)} messages to {args.output}")
+            print(f"Saved {len(messages)} messages to {args.output}\n")
 
     except Exception as e:
         print(f"Error: {e}")
-
 
 if __name__ == "__main__":
     main()
