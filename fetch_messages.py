@@ -16,6 +16,12 @@ from slack_sdk.errors import SlackApiError
 # Load environment variables
 load_dotenv()
 
+# Try to import channel config, but don't fail if it doesn't exist
+try:
+    from channel_config import get_channel_id as get_cached_channel_id
+except ImportError:
+    get_cached_channel_id = None
+
 
 class SlackMessageFetcher:
     """Fetch messages from Slack channels within a specified time window."""
@@ -277,6 +283,7 @@ class SlackMessageFetcher:
     def get_channel_id_by_name(self, channel_name):
         """
         Get channel ID from channel name.
+        First checks cached config, then falls back to API lookup.
 
         Args:
             channel_name: Channel name (with or without #)
@@ -285,8 +292,15 @@ class SlackMessageFetcher:
             Channel ID or None if not found
         """
         # Remove # if present
-        channel_name = channel_name.lstrip("#").lower()
+        channel_name_clean = channel_name.lstrip("#").lower()
 
+        # Check cached config first
+        if get_cached_channel_id:
+            cached_id = get_cached_channel_id(channel_name_clean)
+            if cached_id:
+                return cached_id
+
+        # Fall back to API lookup
         try:
             # Fetch all channels with pagination
             cursor = None
@@ -307,7 +321,7 @@ class SlackMessageFetcher:
 
             # Search for matching channel (case-insensitive)
             for channel in all_channels:
-                if channel.get("name", "").lower() == channel_name:
+                if channel.get("name", "").lower() == channel_name_clean:
                     channel_id = channel.get("id")
                     # Cache it
                     self._channel_cache[channel_id] = channel.get("name")
@@ -318,10 +332,13 @@ class SlackMessageFetcher:
             similar = [
                 c.get("name")
                 for c in all_channels
-                if channel_name in c.get("name", "").lower()
+                if channel_name_clean in c.get("name", "").lower()
             ]
             if similar:
                 print(f"Did you mean one of these? {', '.join(similar[:5])}")
+                print(
+                    f"\nTo add a channel to config: python3 add_channel.py CHANNEL_NAME"
+                )
 
             return None
 
