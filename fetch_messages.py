@@ -5,6 +5,7 @@ Can be used as a standalone script or imported by other Python scripts.
 """
 
 import os
+import argparse
 from datetime import datetime, timedelta
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
@@ -275,27 +276,106 @@ class SlackMessageFetcher:
             Channel ID or None if not found
         """
         # Remove # if present
-        channel_name = channel_name.lstrip("#")
+        channel_name = channel_name.lstrip("#").lower()
 
         try:
-            # Fetch all channels
-            response = self.client.conversations_list(
-                types="public_channel,private_channel",
-                limit=1000
-            )
+            # Fetch all channels with pagination
+            cursor = None
+            all_channels = []
 
-            for channel in response.get("channels", []):
-                if channel.get("name") == channel_name:
+            while True:
+                response = self.client.conversations_list(
+                    types="public_channel,private_channel",
+                    limit=1000,
+                    cursor=cursor
+                )
+
+                channels = response.get("channels", [])
+                all_channels.extend(channels)
+
+                # Check for more pages
+                cursor = response.get("response_metadata", {}).get("next_cursor")
+                if not cursor:
+                    break
+
+            # Search for matching channel (case-insensitive)
+            for channel in all_channels:
+                if channel.get("name", "").lower() == channel_name:
                     channel_id = channel.get("id")
                     # Cache it
-                    self._channel_cache[channel_id] = channel_name
+                    self._channel_cache[channel_id] = channel.get("name")
                     return channel_id
+
+            # If not found, show similar channels for debugging
+            print(f"\nChannel '{channel_name}' not found.")
+            similar = [c.get("name") for c in all_channels if channel_name in c.get("name", "").lower()]
+            if similar:
+                print(f"Did you mean one of these? {', '.join(similar[:5])}")
 
             return None
 
         except SlackApiError as e:
             print(f"Error fetching channels: {e.response['error']}")
             return None
+
+
+def fetch_messages_as_json(channel_id, window="24h", limit=1000):
+    """
+    Fetch messages and return as a formatted JSON dictionary.
+    Useful for calling from other Python scripts.
+
+    Args:
+        channel_id: Slack channel ID or name
+        window: Time window string (e.g., "1h", "24h", "7d")
+        limit: Maximum number of messages to fetch
+
+    Returns:
+        Dictionary with formatted messages ready for JSON serialization
+    """
+    fetcher = SlackMessageFetcher()
+
+    # Get channel ID if name is provided
+    if not channel_id.startswith("C"):
+        channel_id = fetcher.get_channel_id_by_name(channel_id)
+        if not channel_id:
+            raise ValueError(f"Channel not found")
+
+    # Parse time window
+    start_time, end_time = parse_time_window(window)
+
+    # Fetch messages
+    messages = fetcher.fetch_messages(channel_id, start_time, end_time, limit)
+    channel_name = f"#{fetcher.get_channel_name(channel_id)}"
+
+    # Format messages for JSON output
+    formatted_messages = []
+    for msg in messages:
+        msg_time = datetime.fromisoformat(msg['datetime'])
+        time_str = msg_time.strftime("%b %d, %Y at %I:%M:%S %p")
+        user_name = fetcher.get_user_name(msg['user'])
+
+        # Build content with thread context if applicable
+        content = msg['text']
+        if msg.get('thread_ts') and msg['thread_ts'] != msg['timestamp']:
+            parent = fetcher.get_thread_parent(channel_id, msg['thread_ts'])
+            if parent:
+                parent_user = fetcher.get_user_name(parent.get('user'))
+                parent_text = parent.get('text', '')
+                if len(parent_text) > 60:
+                    parent_text = parent_text[:60] + "..."
+                content = f"{content} Reply to {parent_user}: '{parent_text}'"
+
+        formatted_messages.append({
+            "timestamp": time_str,
+            "user": user_name,
+            "content": content
+        })
+
+    # Build final JSON output
+    return {
+        "channel_name": channel_name,
+        "messages": formatted_messages
+    }
 
 
 def parse_time_window(window_str):
@@ -345,7 +425,7 @@ def parse_time_window(window_str):
 
 def main():
     """Command-line interface for fetching messages."""
-    import argparse
+
 
     parser = argparse.ArgumentParser(description="Fetch Slack messages from a time window")
     parser.add_argument("channel", help="Channel ID or name (e.g., C1234567890 or #general)")
@@ -375,22 +455,20 @@ def main():
     # Parse time window
     try:
         start_time, end_time = parse_time_window(args.window)
-        print(f"\nFetching messages from:")
-        print(f"  Start: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"  End:   {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
     except Exception as e:
         print(f"Error parsing time window: {e}")
         return
 
     # Fetch messages
     try:
-        messages = fetcher.fetch_messages(channel_id, start_time, end_time, args.limit)
-        print(f"\n{'='*70}")
-        print(f"Fetched {len(messages)} messages from #{fetcher.get_channel_name(channel_id)}")
-        print(f"{'='*70}\n")
+        import json
 
-        # Display messages in readable format
-        for i, msg in enumerate(messages, 1):
+        messages = fetcher.fetch_messages(channel_id, start_time, end_time, args.limit)
+        channel_name = f"#{fetcher.get_channel_name(channel_id)}"
+
+        # Format messages for JSON output
+        formatted_messages = []
+        for msg in messages:
             # Parse datetime
             msg_time = datetime.fromisoformat(msg['datetime'])
             time_str = msg_time.strftime("%b %d, %Y at %I:%M:%S %p")
@@ -398,12 +476,8 @@ def main():
             # Get user name
             user_name = fetcher.get_user_name(msg['user'])
 
-            # Format message
-            print(f"[{i}] {time_str}")
-            print(f"User: {user_name}")
-            print(f"Message: {msg['text']}")
-
-            # Show thread context if in a thread
+            # Build content with thread context if applicable
+            content = msg['text']
             if msg.get('thread_ts') and msg['thread_ts'] != msg['timestamp']:
                 parent = fetcher.get_thread_parent(channel_id, msg['thread_ts'])
                 if parent:
@@ -412,27 +486,33 @@ def main():
                     # Truncate parent text if too long
                     if len(parent_text) > 60:
                         parent_text = parent_text[:60] + "..."
-                    print(f"  Reply to {parent_user}: \"{parent_text}\"")
-                else:
-                    print(f"  (in thread)")
+                    content = f"{content} Reply to {parent_user}: '{parent_text}'"
 
-            print(f"{'-'*70}\n")
+            formatted_messages.append({
+                "timestamp": time_str,
+                "user": user_name,
+                "content": content
+            })
 
-        # Summary
-        print(f"\n{'='*70}")
-        print(f"Total: {len(messages)} messages")
-        print(f"{'='*70}\n")
+        # Build final JSON output
+        output = {
+            # "message_start_timestamp": start_time.strftime("%Y-%m-%d %H:%M:%S"),
+            # "message_end_timestamp": end_time.strftime("%Y-%m-%d %H:%M:%S"),
+            "channel_name": channel_name,
+            "messages": formatted_messages
+        }
 
-        # Save to file if requested
+        # Output JSON
         if args.output:
-            import json
-
             with open(args.output, "w") as f:
-                json.dump(messages, f, indent=2)
-            print(f"Saved {len(messages)} messages to {args.output}\n")
+                json.dump(output, f, indent=4)
+            print(f"Saved {len(messages)} messages to {args.output}")
+        else:
+            print(json.dumps(output, indent=4))
 
     except Exception as e:
         print(f"Error: {e}")
+
 
 if __name__ == "__main__":
     main()
