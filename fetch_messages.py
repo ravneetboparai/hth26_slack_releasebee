@@ -308,7 +308,7 @@ class SlackMessageFetcher:
 
             while True:
                 response = self.client.conversations_list(
-                    types="public_channel,private_channel", limit=1000, cursor=cursor
+                    types="public_channel,private_channel", limit=1000, cursor=cursor, exclude_archived=True
                 )
 
                 channels = response.get("channels", [])
