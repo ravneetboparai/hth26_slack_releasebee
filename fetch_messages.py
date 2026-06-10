@@ -406,6 +406,8 @@ def parse_time_window(window_str):
     Parse time window string into start and end datetime objects.
 
     Supported formats:
+    - "1m" or "1min" - last 1 minute
+    - "5m" or "5min" - last 5 minutes
     - "1h" - last 1 hour
     - "24h" - last 24 hours
     - "7d" - last 7 days
@@ -420,13 +422,16 @@ def parse_time_window(window_str):
     """
     now = datetime.now()
 
-    # Parse relative time (e.g., "1h", "24h", "7d")
+    # Parse relative time (e.g., "1h", "24h", "7d", "5min")
     if window_str.endswith("h"):
         hours = int(window_str[:-1])
         return now - timedelta(hours=hours), now
     elif window_str.endswith("d"):
         days = int(window_str[:-1])
         return now - timedelta(days=days), now
+    elif window_str.endswith("min"):
+        minutes = int(window_str[:-3])
+        return now - timedelta(minutes=minutes), now
     elif window_str.endswith("m"):
         minutes = int(window_str[:-1])
         return now - timedelta(minutes=minutes), now
@@ -457,7 +462,7 @@ def main():
     parser.add_argument(
         "--window",
         default="24h",
-        help='Time window (e.g., "1h", "24h", "7d", "2023-01-01", "2023-01-01 10:00 to 2023-01-01 12:00")',
+        help='Time window (e.g., "1min", "5min", "1h", "24h", "7d", "2023-01-01", "2023-01-01 10:00 to 2023-01-01 12:00")',
     )
     parser.add_argument(
         "--limit", type=int, default=1000, help="Maximum number of messages to fetch"
